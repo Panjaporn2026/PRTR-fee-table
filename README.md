@@ -1,4 +1,3 @@
-[app.py](https://github.com/user-attachments/files/28662521/app.py)
 import streamlit as st
 import pdfplumber
 import openpyxl
