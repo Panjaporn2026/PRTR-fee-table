@@ -329,7 +329,6 @@ def detect_fee_structure(text, tables):
                 rates[k] = v
 
     # 3. Determine number of fill columns from contract
-    # n_fixed_raw = actual # of conditions in contract (1, 2, or 4)
     if n_fixed_raw >= 4:
         n_cols = 4
     elif n_fixed_raw >= 2:
@@ -342,6 +341,16 @@ def detect_fee_structure(text, tables):
         n_cols = 2
     if 'variable' not in rates:
         rates['variable'] = rates.get('fixed', [0.15, 0.15])[:n_cols]
+
+    # Recalculate n_cols from actual rates (handles scanned PDF where table=empty, text fallback ran)
+    fixed_r = pad4(rates.get('fixed', [0.20]))
+    if fixed_r[0] == fixed_r[1] == fixed_r[2] == fixed_r[3]:
+        detected_n = 1
+    elif fixed_r[1] == fixed_r[2] == fixed_r[3]:
+        detected_n = 2 if fixed_r[0] != fixed_r[1] else 1
+    else:
+        detected_n = 4
+    n_cols = max(n_cols, detected_n)
 
     # 4. Fill remaining common rates (skip PRTR-managed)
     rates = fill_common(rates, add, prtr_cats)
