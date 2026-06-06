@@ -219,10 +219,21 @@ def parse_fee_table(tables):
                     rates[current_cat] = pad4(pcts)
 
     # Flush remaining fixed rates
+    n_fixed_raw = len(fixed_rates)   # count BEFORE padding
     if fixed_rates and 'fixed' not in rates:
         rates['fixed'] = fixed_rates[:4] if len(fixed_rates) >= 4 else pad4(fixed_rates)
+    elif 'fixed' in rates:
+        # already saved mid-loop; count was set when flushed, approximate from padded list
+        # detect repetition: [20,15,15,15] → 2 raw; [18,8,15,7] → 4 raw; [22,22,22,22] → 1 raw
+        r = rates['fixed']
+        if r[0] == r[1] == r[2] == r[3]:
+            n_fixed_raw = 1
+        elif r[1] == r[2] == r[3]:
+            n_fixed_raw = 2 if r[0] != r[1] else 1
+        else:
+            n_fixed_raw = 4
 
-    return rates, prtr_cats
+    return rates, prtr_cats, n_fixed_raw
 
 
 # ─── Text-based fallback ──────────────────────────────────────────────────────
@@ -293,7 +304,7 @@ def detect_fee_structure(text, tables):
     add = m.group(0) if m else text
 
     # 1. Structured table parser (most reliable)
-    rates, prtr_cats = parse_fee_table(tables)
+    rates, prtr_cats, n_fixed_raw = parse_fee_table(tables)
 
     # 2. Text fallback for missing categories
     if 'fixed' not in rates or 'variable' not in rates:
@@ -301,22 +312,32 @@ def detect_fee_structure(text, tables):
             if k not in rates:
                 rates[k] = v
 
-    # 3. Structure from number of fixed rates
-    n_fixed = len(rates.get('fixed', []))
-    struct = 'tiered' if n_fixed >= 4 else 'flat'
+    # 3. Determine number of fill columns from contract
+    # n_fixed_raw = actual # of conditions in contract (1, 2, or 4)
+    if n_fixed_raw >= 4:
+        n_cols = 4
+    elif n_fixed_raw >= 2:
+        n_cols = 2
+    else:
+        n_cols = 1
 
     if 'fixed' not in rates:
         rates['fixed'] = [0.20, 0.15]
+        n_cols = 2
     if 'variable' not in rates:
-        rates['variable'] = rates.get('fixed', [0.15, 0.15])[:2]
+        rates['variable'] = rates.get('fixed', [0.15, 0.15])[:n_cols]
 
     # 4. Fill remaining common rates (skip PRTR-managed)
     rates = fill_common(rates, add, prtr_cats)
-    return struct, rates, prtr_cats
+    return n_cols, rates, prtr_cats
 
 
 # ─── Excel filler ─────────────────────────────────────────────────────────────
-def fill_excel(template_bytes, rates, is_tiered, prtr_cats=None):
+def fill_excel(template_bytes, rates, n_cols, prtr_cats=None):
+    """
+    n_cols: 1=fill J only, 2=fill J+K, 4=fill J+K+L+M
+    prtr_cats: set of categories where contract says PRTR is responsible (fill 'PRTR' text)
+    """
     if prtr_cats is None:
         prtr_cats = set()
 
@@ -336,9 +357,10 @@ def fill_excel(template_bytes, rates, is_tiered, prtr_cats=None):
         paycode = str(row[6].value).strip() if row[6].value else ''
         header  = str(row[3].value).strip() if row[3].value else ''
         j, k, l, m = row[9], row[10], row[11], row[12]
+        all_cells = [j, k, l, m]
 
         if cost == 'PRTR':
-            for cell in [j, k, l, m]:
+            for cell in all_cells:
                 cell.value = 'PRTR'
         elif cost == 'CLNT':
             if paycode == '1 M NOTICE' or header == 'Severance Pay':
@@ -347,17 +369,17 @@ def fill_excel(template_bytes, rates, is_tiered, prtr_cats=None):
                 category = ACCOUNT_MAP.get(account)
             if category:
                 if category in prtr_cats:
-                    # Contract specifies PRTR handles this — no client fee
-                    for cell in [j, k, l, m]:
-                        cell.value = 'PRTR'
+                    # Contract specifies PRTR handles this — fill 'PRTR' for active cols, clear rest
+                    for i, cell in enumerate(all_cells):
+                        cell.value = 'PRTR' if i < n_cols else None
                 else:
                     r = pad4(rates.get(category, [0.0]))
-                    for cell, val in zip([j, k, l, m], r):
-                        cell.value = val
-                        cell.number_format = pct_fmt
-                    if not is_tiered:
-                        l.value = None
-                        m.value = None
+                    for i, cell in enumerate(all_cells):
+                        if i < n_cols:
+                            cell.value = r[i]
+                            cell.number_format = pct_fmt
+                        else:
+                            cell.value = None
 
     wb.save(tmp_out)
     with open(tmp_out, 'rb') as f:
@@ -385,15 +407,15 @@ if pdf_file and xlsx_file:
         pdf_bytes = pdf_file.read()
         full_text, tables = extract_all_from_pdf(pdf_bytes)
         company_name = extract_company_name(full_text, pdf_file.name)
-        struct_type, rates, prtr_cats = detect_fee_structure(full_text, tables)
+        n_cols, rates, prtr_cats = detect_fee_structure(full_text, tables)
 
     st.success("✅ อ่านสัญญาเสร็จแล้ว")
     st.subheader("📋 ข้อมูลที่อ่านได้จากสัญญา")
     st.write(f"**บริษัท Client:** {company_name}")
 
-    n_fixed = len(rates.get('fixed', []))
-    struct_label = f'Tiered 4 อัตรา (J/K/L/M)' if struct_type == 'tiered' else 'Flat Rate (J=Recruit by PRTR, K=Recruit by Client)'
-    st.write(f"**ประเภท Fee:** {struct_label}")
+    col_labels_active = ['J', 'K', 'L', 'M'][:n_cols]
+    struct_label = {1: '1 Condition (J only)', 2: '2 Conditions (J, K)', 4: '4 Conditions / Tiered (J, K, L, M)'}.get(n_cols, f'{n_cols} Conditions')
+    st.write(f"**จำนวน Conditions:** {struct_label}")
 
     if prtr_cats:
         cat_name_map = {
@@ -404,13 +426,12 @@ if pdf_file and xlsx_file:
         names = ', '.join(cat_name_map.get(c, c) for c in sorted(prtr_cats))
         st.info(f"📌 รายการที่สัญญาระบุว่า **PRTR** รับผิดชอบ (จะใส่ 'PRTR' ในไฟล์): {names}")
 
-    col_labels = ['J', 'K', 'L', 'M']
     import pandas as pd
 
     def fmt(cat):
         if cat in prtr_cats:
-            return ['PRTR'] * 4
-        return [f"{v*100:.1f}%" for v in rates.get(cat, [0]*4)]
+            return ['PRTR'] * n_cols
+        return [f"{v*100:.1f}%" for v in rates.get(cat, [0]*4)[:n_cols]]
 
     rate_display = {
         'Fixed income':           fmt('fixed'),
@@ -421,7 +442,7 @@ if pdf_file and xlsx_file:
         'Health Insurance':       fmt('health_ins'),
         'Severance/Compensation': fmt('compensation'),
     }
-    df = pd.DataFrame(rate_display, index=col_labels).T
+    df = pd.DataFrame(rate_display, index=col_labels_active).T
     st.dataframe(df, use_container_width=True)
 
     with st.expander("🔍 ดูข้อความที่อ่านจาก PDF (ใช้ตรวจสอบเมื่อค่าไม่ถูกต้อง)"):
@@ -442,21 +463,21 @@ if pdf_file and xlsx_file:
                 st.write(f"**{label}**: PRTR (ตามสัญญา)")
                 continue
             current = pad4(rates.get(key, [0.0]))
-            cols = st.columns(4)
+            edit_cols = st.columns(n_cols)
             new_vals = []
-            for i, (c, lbl) in enumerate(zip(cols, col_labels)):
+            for i, (c, lbl) in enumerate(zip(edit_cols, col_labels_active)):
                 v = current[i] if i < len(current) else current[-1]
                 nv = c.number_input(f"{label} - {lbl}", value=round(v*100, 2),
                                     min_value=0.0, max_value=100.0, step=0.5,
                                     key=f"{key}_{i}") / 100
                 new_vals.append(nv)
-            rates[key] = new_vals
+            rates[key] = pad4(new_vals)
 
     st.divider()
     if st.button("🚀 Generate Fee Table", type="primary", use_container_width=True):
         with st.spinner("กำลังสร้างไฟล์..."):
             xlsx_file.seek(0)
-            out_bytes = fill_excel(xlsx_file.read(), rates, struct_type == 'tiered', prtr_cats)
+            out_bytes = fill_excel(xlsx_file.read(), rates, n_cols, prtr_cats)
             output_filename = f"Master - Fee tebla_{company_name}.xlsx"
         st.success("✅ สร้างไฟล์เสร็จแล้ว!")
         st.download_button(
