@@ -59,6 +59,7 @@ def extract_all_from_pdf(pdf_bytes):
         f.write(pdf_bytes)
         tmp_path = f.name
     try:
+        # 1. Try pdfplumber first (fast, works for text-based PDFs)
         text_pages, all_tables = [], []
         with pdfplumber.open(tmp_path) as pdf:
             for page in pdf.pages:
@@ -68,7 +69,22 @@ def extract_all_from_pdf(pdf_bytes):
                 tbls = page.extract_tables()
                 if tbls:
                     all_tables.extend(tbls)
-        return '\n'.join(text_pages), all_tables
+        full_text = '\n'.join(text_pages)
+
+        # 2. Fallback to OCR for scanned PDFs (no embedded text)
+        if not full_text.strip():
+            try:
+                from pdf2image import convert_from_path
+                import pytesseract
+                images = convert_from_path(tmp_path, dpi=150)
+                ocr_parts = []
+                for img in images:
+                    ocr_parts.append(pytesseract.image_to_string(img, lang='tha+eng'))
+                full_text = '\n'.join(ocr_parts)
+            except Exception:
+                pass  # OCR unavailable — user must enter rates manually
+
+        return full_text, all_tables
     finally:
         os.unlink(tmp_path)
 
